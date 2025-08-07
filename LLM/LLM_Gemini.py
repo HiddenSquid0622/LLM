@@ -12,7 +12,8 @@ import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 from pdfminer.high_level import extract_text
 import docx
-from django.conf import settings
+import settings
+from settings import GEMINI_API_KEY
 
 
 # In[ ]:
