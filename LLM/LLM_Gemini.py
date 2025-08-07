@@ -9,11 +9,12 @@ import json
 import urllib.request
 import urllib.error
 import numpy as np
+import base64
+import io
 from sklearn.metrics.pairwise import cosine_similarity
 from pdfminer.high_level import extract_text
 import docx
-import settings
-from settings import GEMINI_API_KEY
+from django.conf import settings
 
 
 # In[ ]:
@@ -22,10 +23,12 @@ from settings import GEMINI_API_KEY
 API_KEY = settings.GEMINI_API_KEY
 MODEL_NAME = "gemini-2.5-flash-preview-05-20"
 API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={API_KEY}"
+EMBEDDING_MODEL_NAME = "embedding-001"
+EMBEDDING_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{EMBEDDING_MODEL_NAME}:embedContent?key={API_KEY}"
 def call_gemini_generation_api(prompt):
     """Makes an API call to the Gemini text generation model."""
-    if not GENERATION_API_URL:
-        print("Error: Generation API_URL is not configured. Is the API key missing?")
+    if not API_URL:
+        print("Error: API_URL is not configured. Is the API key missing?")
         return None
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
     headers = {'Content-Type': 'application/json'}
@@ -50,7 +53,7 @@ def call_gemini_generation_api(prompt):
 def get_embedding(text):
     """Generates a vector embedding for a given text using the embedding model."""
     if not EMBEDDING_API_URL:
-        print("Error: Embedding API_URL is not configured. Is the API key missing?")
+        print("Error: Embedding API_URL is not configured.")
         return None
     payload = {"model": f"models/{EMBEDDING_MODEL_NAME}", "content": {"parts": [{"text": text}]}}
     headers = {'Content-Type': 'application/json'}
@@ -75,29 +78,35 @@ def get_embedding(text):
 def load_documents_from_django_dataset(dataset):
     processed_docs = {}
     for doc_data in dataset:
-        file_path = doc_data.get("file_path")
+        file_name = doc_data.get("file_name")
         file_type = doc_data.get("file_type")
-        content = ""
+        encoded_content = doc_data.get("content")
+        if not file_name or not file_type or not encoded_content:
+            print(f"Missing fields in dataset item: {doc_data}")
+            continue
         try:
+            file_bytes = base64.b64decode(encoded_content)
+            content = ""
             if file_type == 'pdf':
-                content = extract_text(file_path)
-                print(f"Successfully loaded and processed PDF: {file_path}")
+                with io.BytesIO(file_bytes) as pdf_file:
+                    content = extract_text(pdf_file)
+                print(f"Successfully decoded and processed PDF: {file_name}")
             elif file_type == 'docx':
-                doc = docx.Document(file_path)
-                content = "\n".join([para.text for para in doc.paragraphs])
-                print(f"Successfully loaded and processed DOCX: {file_path}")
+                with io.BytesIO(file_bytes) as docx_file:
+                    doc = docx.Document(docx_file)
+                    content = "\n".join([para.text for para in doc.paragraphs])
+                print(f"Successfully decoded and processed DOCX: {file_name}")
             elif file_type in ['txt', 'email']:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                print(f"Successfully loaded and processed Text/Email: {file_path}")
+                content = file_bytes.decode('utf-8')
+                print(f"Successfully decoded and processed Text/Email: {file_name}")
             else:
-                print(f"Warning: Unsupported file type '{file_type}' for {file_path}")
+                print(f"Warning: Unsupported file type '{file_type}' for {file_name}")
                 continue
-            processed_docs[os.path.basename(file_path)] = content
-        except FileNotFoundError:
-            print(f"Error: The file was not found at {file_path}")
+            processed_docs[file_name] = content
+        except base64.binascii.Error:
+            print(f"Error decoding base64 content for {file_name}")
         except Exception as e:
-            print(f"An error occurred while processing {file_path}: {e}")
+            print(f"An error occurred while processing {file_name}: {e}")
     return processed_docs
 
 
@@ -116,7 +125,7 @@ def parse_query_with_llm(query):
     JSON Output:
     """
     print("\nParsing Query with Gemini LLM")
-    parsed_json_string = call_gemini_api(prompt)
+    parsed_json_string = call_gemini_generationmapi(prompt)
 
     if not parsed_json_string:
         print("Error: Received no response from LLM for query parsing.")
@@ -135,18 +144,18 @@ def parse_query_with_llm(query):
 # In[ ]:
 
 
-def semantic_search_with_embeddings(query, documents, top_k=3):
+def semantic_search_with_embeddings(query, processed_docs, top_k=3):
     print("\n--- Performing Semantic Search with Vector Embeddings ---")
-    chunks = []
-    for doc_name, content in documents.items():
-        paragraphs = [p.strip() for p in content.split('\n') if len(p.strip()) > 50]
-        for p in paragraphs:
-            chunks.append({"source": doc_name, "text": p})
-    if not chunks:
-        print("Could not create any text chunks from the documents.")
+    if not processed_docs:
+        print("No document provided.")
         return []
-    print(f"Created {len(chunks)} text chunks from documents.")
-
+    doc_name, content = next(iter(processed_docs.items()))
+    paragraphs = [p.strip() for p in content.split('\n') if len(p.strip()) > 50]
+    if not paragraphs:
+        print("No valid paragraphs found in the document.")
+        return []
+    chunks = [{"source": doc_name, "text": p} for p in paragraphs]
+    print(f"Created {len(chunks)} text chunks from document '{doc_name}'.")
     print("Generating embedding for the query...")
     query_embedding = get_embedding(query)
     if not query_embedding:
@@ -175,7 +184,6 @@ def semantic_search_with_embeddings(query, documents, top_k=3):
         }
         relevant_clauses.append(clause)
         print(f"  - Found relevant clause from '{clause['source']}' (Similarity: {clause['similarity']:.4f}): \"{clause['clause'][:100]}...\"")
-        
     return relevant_clauses
 
 
@@ -217,12 +225,12 @@ def evaluate_and_decide_with_llm(structured_query, relevant_clauses):
 
 def process_query_pipeline(query, django_dataset):
     if not API_KEY:
-        return {"error": "Gemini API key is not configured. Please check your config.json file."}
-    documents = load_documents_from_django_dataset(django_dataset)
-    if not documents: return {"error": "No documents could be loaded or processed."}
+        return {"error": "Gemini API key is not configured. Please check."}
+    processed_docs = load_documents_from_django_dataset(django_dataset)
+    if not processed_docs: return {"error": "No documents could be loaded or processed."}
     structured_query = parse_query_with_llm(query)
     if not structured_query: return {"error": "Failed to parse the user query."}
-    relevant_clauses = semantic_search_with_embeddings(query, documents)
+    relevant_clauses = semantic_search_with_embeddings(query, processed_docs)
     if not relevant_clauses:
         return {"decision": "Cannot Determine", "amount": 0, "justification": "No relevant clauses found for the query."}
     final_response = evaluate_and_decide_with_llm(structured_query, relevant_clauses)
