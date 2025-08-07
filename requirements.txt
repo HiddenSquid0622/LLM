@@ -6,3 +6,4 @@ google-generativeai
 numpy
 scikit-learn
 gunicorn
+Django
